@@ -48,12 +48,12 @@ def callback_frame_end(frame: bytes) -> int:
 def build_documented_sender_frame(prefix: bytes, data: bytes) -> bytes:
     """Model the C# comment: decimal(len(data)+len(prefix)) NUL prefix NUL data."""
     advertised = len(prefix) + len(data)
-    return str(advertised).encode("ascii") + b"\\x00" + prefix + b"\\x00" + data
+    return str(advertised).encode("ascii") + b"\x00" + prefix + b"\x00" + data
 
 
 def current_reader_frame_end(frame: bytes) -> int:
     """Model ClientConnection.ReadHeaderAsync + wirePayloadLength=advertised."""
-    nul = frame.index(b"\\x00")
+    nul = frame.index(b"\x00")
     return nul + 1 + int(frame[:nul].decode("ascii"))
 
 class LegacyTcpCompatibilitySpecTests(unittest.TestCase):
@@ -74,7 +74,7 @@ class LegacyTcpCompatibilitySpecTests(unittest.TestCase):
     def test_documented_sender_length_plus_separator_consumes_complete_frame(self) -> None:
         prefix = b"\\x00alice\\x00FORWARD\\x00bob\\x00UniChat\\x00"
         frame = build_documented_sender_frame(prefix, b"payload")
-        nul = frame.index(b"\\x00")
+        nul = frame.index(b"\x00")
         corrected_end = nul + 1 + int(frame[:nul].decode("ascii")) + 1
         self.assertEqual(corrected_end, len(frame))
 
