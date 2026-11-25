@@ -173,6 +173,13 @@ namespace UniChatServerd
                     Log.Debug("[СЕССИЯ] Клиент {ClientIp} штатно отключился.", _remoteIp);
                     Close("peer_closed");
                 }
+                catch (InvalidDataException ex)
+                {
+                    _auditLog.Record("protocol_error", _sessionId, ClientId, _remoteIp,
+                        result: "invalid_frame", details: ex.Message);
+                    Log.Warning(ex, "[СЕССИЯ] Некорректный framing от {ClientIp}.", _remoteIp);
+                    Close("protocol_error");
+                }
                 catch (IOException ex)
                 {
                     _auditLog.Record("transport_error", _sessionId, ClientId, _remoteIp,
