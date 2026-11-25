@@ -168,6 +168,7 @@ def main() -> int:
             broadcast = build_frame(b"alice", b"*", b"broadcast-check", 7)
             alice.sendall(broadcast)
             assert recv_frame(bob) == broadcast, "broadcast was not byte-exact"
+            assert recv_frame(alice) == broadcast, "broadcast sender did not receive its own copy"
 
             # Disconnect/reconnect the same ID and verify it can receive again.
             bob.close()
