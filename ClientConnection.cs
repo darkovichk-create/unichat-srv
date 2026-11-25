@@ -5,6 +5,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Text;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -348,7 +349,7 @@ namespace UniChatServerd
 
             buffer.Release();
             _auditLog.Record("queue_overflow", _sessionId, ClientId, _remoteIp,
-                packetBytes: buffer.Length, result: "client_disconnected");
+                packetBytes: buffer.Memory.Length, result: "client_disconnected");
             if (Close("outgoing_queue_full"))
                 Log.Warning("[СЕССИЯ] Очередь {ClientId} переполнена, клиент будет отключен", ClientId);
             return false;
