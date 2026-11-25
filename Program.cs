@@ -16,7 +16,7 @@ namespace UniChatServerd
             var builder = Host.CreateApplicationBuilder(args);
             builder.Configuration.AddCommandLine(args);
             builder.Services.AddSingleton<AuditLog>();
-            builder.Services.AddHostedService(sp => sp.GetRequiredService<AuditLog>());
+            builder.Services.AddHostedService<AuditLog>(sp => sp.GetRequiredService<AuditLog>());
             builder.Services.AddHostedService<TcpServerListener>();
 
             if (OperatingSystem.IsWindows())
