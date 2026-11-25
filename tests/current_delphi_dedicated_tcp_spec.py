@@ -43,7 +43,7 @@ def read_current_server_frame(frame: bytes) -> tuple[int, bytes]:
 
 def client_receiver_frame_end(frame: bytes) -> int:
     """Model current client callback: decimal digit count + NUL + advertised bytes."""
-    header_end = frame.find(b"\\x00")
+    header_end = frame.find(b"\x00")
     if header_end <= 0:
         raise ValueError("missing decimal header")
     advertised = int(frame[:header_end].decode("ascii"))
@@ -110,7 +110,7 @@ class CurrentDelphiDedicatedTcpSpecTests(unittest.TestCase):
             b"alice", b"bob", self.header5, self.primary
         )
         _, payload = read_current_server_frame(frame)
-        marker = b"\\x00UniChat\\x00"
+        marker = b"\x00UniChat\x00"
         marker_offset = payload.index(marker)
         self.assertEqual(payload[marker_offset + len(marker):][:5], self.header5)
 
