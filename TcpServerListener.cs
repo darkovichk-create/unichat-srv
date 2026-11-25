@@ -3,6 +3,7 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
@@ -10,12 +11,15 @@ using Serilog;
 namespace UniChatServerd
 {
 
-    public class TcpServerListener(IConfiguration configuration) : BackgroundService
+    public class TcpServerListener(IConfiguration configuration, AuditLog auditLog) : BackgroundService
     {
         private readonly IConfiguration configuration = configuration;
+        private readonly AuditLog _auditLog = auditLog;
         private readonly IPAddress _ipAddress = IPAddress.Parse(configuration["ip"] ?? "127.0.0.1");
         private readonly int _port = int.Parse(configuration["port"] ?? "6666");
         private readonly ConnectionManager _connectionManager = new();
+        private readonly ConcurrentDictionary<long, Task> _sessionTasks = new();
+        private long _nextSessionTaskId;
         private TcpListener? _server;
 
 
@@ -29,6 +33,7 @@ namespace UniChatServerd
                 _server = new TcpListener(_ipAddress, _port);
                 _server.Start();
                 Log.Information("[СЕРВЕР] Запущен на {ServerIp}:{ServerPort}", _ipAddress, _port);
+                _auditLog.Record("server_started", result: "listening", details: $"{_ipAddress}:{_port}");
 
                 // _ = LogBufferStatsAsync(cancellationToken); // debug
 
@@ -48,16 +53,25 @@ namespace UniChatServerd
                             ConfigureSocket(client.Client);
                             Log.Debug("[СЕРВЕР] Подключился новый клиент: {ClientIp}", client.Client.RemoteEndPoint);
 
-                            var connection = new ClientConnection(client, _connectionManager, cancellationToken);
+                            var connection = new ClientConnection(client, _connectionManager, cancellationToken, _auditLog);
 
                             // Мгновенно отправляем клиента на обработку в фоновую задачу.
                             // Использование discard (_) сообщает компилятору, что мы не ждем (await) 
                             // завершения работы с этим клиентом прямо здесь, а сразу готовы принимать следующего.
-                            // Запускаем без await, но с защитой от потери исключений
-                            _ = HandleClientSafeAsync(connection);
+                            // Отслеживаем все задачи сессий, чтобы дождаться их завершения при остановке.
+                            long taskId = Interlocked.Increment(ref _nextSessionTaskId);
+                            Task sessionTask = HandleClientSafeAsync(connection);
+                            _sessionTasks[taskId] = sessionTask;
+                            _ = sessionTask.ContinueWith(
+                                completed => _sessionTasks.TryRemove(taskId, out _),
+                                CancellationToken.None,
+                                TaskContinuationOptions.ExecuteSynchronously,
+                                TaskScheduler.Default);
                         }
                         catch (Exception ex)
                         {
+                            _auditLog.Record("accept_error", remoteIp: client.Client?.RemoteEndPoint?.ToString(),
+                                result: "accept_failed", details: ex.Message);
                             Log.Warning(ex, "[СЕРВЕР] Не удалось принять клиента {ClientIp}", client.Client?.RemoteEndPoint);
                             client.Dispose();
                         }
@@ -84,9 +98,34 @@ namespace UniChatServerd
             {
                 _server?.Stop();
                 Log.Information("[СЕРВЕР] ОСТАНОВЛЕН. Очистка ресурсов завершена.");
+                _auditLog.Record("server_stopped", result: "listener_stopped");
             }
         }
 
+
+        public override async Task StopAsync(CancellationToken cancellationToken)
+        {
+            // Сначала отменяем listener token и дожидаемся завершения Accept loop.
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+
+            Task[] remaining = _sessionTasks.Values.ToArray();
+            if (remaining.Length == 0)
+                return;
+
+            try
+            {
+                await Task.WhenAll(remaining)
+                    .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _auditLog.Record("shutdown_warning", result: "session_drain_timeout",
+                    details: $"remaining_sessions={_sessionTasks.Count}");
+                Log.Warning("[СЕРВЕР] Не все клиентские сессии завершились за 15 секунд: {Count}",
+                    _sessionTasks.Count);
+            }
+        }
 
         // Отдельный приватный метод для безопасности
         private async Task HandleClientSafeAsync(ClientConnection connection)
