@@ -171,12 +171,34 @@ def main() -> int:
 
             # Disconnect/reconnect the same ID and verify it can receive again.
             bob.close()
-            time.sleep(0.4)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if db_path.exists():
+                    with sqlite3.connect(db_path) as audit:
+                        closed = audit.execute(
+                            "SELECT COUNT(*) FROM audit_events "
+                            "WHERE event_type='session_closed' AND client_id='bob'"
+                        ).fetchone()[0]
+                    if closed:
+                        break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(
+                    "server did not record closure of the old Bob session:\\n"
+                    + log_path.read_text(errors="replace")
+                )
             bob = connect(port)
             clients.append(bob)
             reconnect = build_frame(b"bob", b"alice", b"reconnected", 8)
             bob.sendall(reconnect)
-            assert recv_frame(alice) == reconnect, "reconnected client did not register"
+            try:
+                routed_reconnect = recv_frame(alice)
+            except Exception:
+                raise AssertionError(
+                    "reconnected client did not register:\\n"
+                    + log_path.read_text(errors="replace")
+                )
+            assert routed_reconnect == reconnect, "reconnected route changed bytes"
             after_reconnect = build_frame(b"alice", b"bob", b"after-reconnect", 9)
             alice.sendall(after_reconnect)
             assert recv_frame(bob) == after_reconnect, "reconnected client did not receive"
