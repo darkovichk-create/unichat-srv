@@ -5,8 +5,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>dotnet-UniChatServerd-69af2c8b-4616-4418-a3fa-7dc721fb7e33</UserSecretsId>
-    <Authors>Sergey Rihmayer</Authors>
-    <Copyright>Sergey Rihmayer</Copyright>
+    <Authors>Sergey Rihmayer (s.rihmayer@mail.ru)</Authors>
+    <Copyright>Original UniChat server: Sergey Rihmayer (s.rihmayer@mail.ru); adaptations: darkovichk-create</Copyright>
     <AssemblyVersion>1.0.0</AssemblyVersion>
     <FileVersion>1.0.0</FileVersion>
   </PropertyGroup>
