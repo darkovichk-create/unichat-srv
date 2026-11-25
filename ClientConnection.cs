@@ -118,9 +118,9 @@ namespace UniChatServerd
                         var (headerLength, advertisedPayloadLength) =
                             await ReadHeaderAsync(headerBuffer, _sessionCts.Token).ConfigureAwait(false);
 
-                        // Старый протокол считает prefix + AData, но не учитывает
-                        // дополнительный #0 между ними. Сохраняем это правило совместимости.
-                        int wirePayloadLength = checked(advertisedPayloadLength + 1);
+                        // Первый NUL префикса одновременно завершает числовой заголовок;
+                        // оставшиеся prefix + разделитель + AData занимают advertisedPayloadLength.
+                        int wirePayloadLength = advertisedPayloadLength;
                         if (wirePayloadLength > MaxPacketSize)
                         {
                             throw new InvalidDataException(
@@ -143,7 +143,7 @@ namespace UniChatServerd
                                 packetBuffer[headerBytesLength..],
                                 _sessionCts.Token).ConfigureAwait(false);
 
-                            HandleAndRoutePacket(buffer);
+                            HandleAndRoutePacket(buffer, headerBytesLength);
                         }
                         finally
                         {
@@ -190,11 +190,11 @@ namespace UniChatServerd
         /// Маршрутизация. Пакеты пересылаются без изменения содержимого,
         /// поэтому серверу не требуется разбирать текст или бинарные данные AData.
         /// </summary>
-        private void HandleAndRoutePacket(RefCountedBuffer buffer)
+        private void HandleAndRoutePacket(RefCountedBuffer buffer, int headerBytesLength)
         {
             ReadOnlyMemory<byte> packet = buffer.Memory;
 
-            if (!TryParsePrefix(packet.Span, out string curId,
+            if (!TryParsePrefix(packet.Span[headerBytesLength..], out string curId,
                                 out ReadOnlySpan<byte> marker, out string toUser))
             {
                 Log.Warning("[СЕССИЯ] Битый пакет: не удалось разобрать структуру по маркерам #0.");
@@ -253,7 +253,7 @@ namespace UniChatServerd
         }
 
         /// <summary>
-        /// Извлекает первые четыре поля протокола, разделённые нулевыми байтами.
+        /// Извлекает ClientId, команду и адресата из начала префикса.
         /// Остальная часть пакета остаётся непрозрачной и пересылается как есть.
         /// </summary>
         private static bool TryParsePrefix(
@@ -289,15 +289,15 @@ namespace UniChatServerd
                 currentPos += nextZero + 1;
             }
 
-            if (pieceCount < 4)
+            if (pieceCount < 3)
                 return false;
 
-            ReadOnlySpan<byte> curIdBytes = fullPacket.Slice(pieceOffsets[1], pieceLengths[1]);
-            ReadOnlySpan<byte> toUserBytes = fullPacket.Slice(pieceOffsets[3], pieceLengths[3]);
+            ReadOnlySpan<byte> curIdBytes = fullPacket.Slice(pieceOffsets[0], pieceLengths[0]);
+            ReadOnlySpan<byte> toUserBytes = fullPacket.Slice(pieceOffsets[2], pieceLengths[2]);
 
             curId = AnsiEncoding.GetString(curIdBytes);
             toUser = AnsiEncoding.GetString(toUserBytes);
-            marker = fullPacket.Slice(pieceOffsets[2], pieceLengths[2]);
+            marker = fullPacket.Slice(pieceOffsets[1], pieceLengths[1]);
 
             return true;
         }
