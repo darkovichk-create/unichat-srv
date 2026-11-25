@@ -1,4 +1,4 @@
-﻿// author Sergey Rihmayer
+// author Sergey Rihmayer
 
 using Serilog;
 using System;
@@ -21,7 +21,8 @@ namespace UniChatServerd
         private readonly CancellationToken _serverToken;
         private readonly CancellationTokenSource _sessionCts;
         private const int HeaderBufferSize = 16;
-        private const int MaxPacketSize = 128 * 1024; // Защита от DoS: максимум на пакет
+        // Максимум байт после заголовка размера, включая разделитель между prefix и AData.
+        private const int MaxPacketSize = 128 * 1024;
         private static readonly Encoding AnsiEncoding = Encoding.GetEncoding(1251);
 
         public string? ClientId { get; private set; }
@@ -30,7 +31,7 @@ namespace UniChatServerd
 
         private readonly Channel<RefCountedBuffer> _outgoing;
         private readonly Task _writerTask;
-        private byte _closed;
+        private int _closed;
 
         public ClientConnection(TcpClient client, ConnectionManager manager, CancellationToken serverToken)
         {
@@ -43,8 +44,8 @@ namespace UniChatServerd
             _outgoing = Channel.CreateBounded<RefCountedBuffer>(
                 new BoundedChannelOptions(capacity: 256)
                 {
-                    SingleReader = true,        // один Writer-цикл на клиента
-                    SingleWriter = false,       // писать могут несколько ридеров отправителей
+                    SingleReader = true,
+                    SingleWriter = false,
                     FullMode = BoundedChannelFullMode.Wait,
                     AllowSynchronousContinuations = false
                 });
@@ -53,7 +54,55 @@ namespace UniChatServerd
         }
 
         /// <summary>
-        /// Жизненный цикл сессии клиента: чтение пакетов в цикле, пока соединение открыто.
+        /// Читает переменный по длине заголовок: ASCII-размер, затем нулевой байт.
+        /// ReadExactlyAsync на фиксированные 16 байт здесь использовать нельзя:
+        /// короткий TCP-пакет не обязан заполнять этот буфер.
+        /// </summary>
+        private async ValueTask<(int HeaderLength, int AdvertisedPayloadLength)> ReadHeaderAsync(
+            byte[] headerBuffer,
+            CancellationToken cancellationToken)
+        {
+            int headerLength = 0;
+
+            while (headerLength < HeaderBufferSize)
+            {
+                int bytesRead = await _stream.ReadAsync(
+                    headerBuffer.AsMemory(headerLength, 1),
+                    cancellationToken).ConfigureAwait(false);
+
+                if (bytesRead == 0)
+                {
+                    if (headerLength == 0)
+                        throw new EndOfStreamException();
+
+                    throw new InvalidDataException("Соединение закрыто внутри заголовка пакета.");
+                }
+
+                if (headerBuffer[headerLength] == 0)
+                {
+                    if (headerLength == 0 ||
+                        !Utf8Parser.TryParse(
+                            headerBuffer.AsSpan(0, headerLength),
+                            out int payloadLength,
+                            out int consumed) ||
+                        consumed != headerLength ||
+                        payloadLength <= 0)
+                    {
+                        throw new InvalidDataException("Некорректная длина пакета в заголовке.");
+                    }
+
+                    return (headerLength, payloadLength);
+                }
+
+                headerLength++;
+            }
+
+            throw new InvalidDataException(
+                $"Заголовок превышает допустимые {HeaderBufferSize - 1} байт без разделителя.");
+        }
+
+        /// <summary>
+        /// Жизненный цикл сессии клиента: чтение и маршрутизация пакетов до отключения.
         /// </summary>
         public async Task HandleClientAsync()
         {
@@ -66,50 +115,34 @@ namespace UniChatServerd
                 {
                     while (!_sessionCts.Token.IsCancellationRequested)
                     {
-                        await _stream.ReadExactlyAsync(headerBuffer, _sessionCts.Token);
+                        var (headerLength, advertisedPayloadLength) =
+                            await ReadHeaderAsync(headerBuffer, _sessionCts.Token).ConfigureAwait(false);
 
-                        if (!TryParseHeader(headerBuffer, out int headerLength, out int payloadLength))
+                        // Старый протокол считает prefix + AData, но не учитывает
+                        // дополнительный #0 между ними. Сохраняем это правило совместимости.
+                        int wirePayloadLength = checked(advertisedPayloadLength + 1);
+                        if (wirePayloadLength > MaxPacketSize)
                         {
-                            if (headerLength == -1)
-                            {
-                                throw new InvalidDataException(
-                                    $"Заголовок превышает {HeaderBufferSize} байт без разделителя.");
-                            }
-                            else 
-                            {
-                                // headerLength >= 0, но TryParseHeader вернул false
-                                // Это ЗНАЧИТ разделитель найден, но перед ним мусор
-                                throw new InvalidDataException(
-                                    $"Невалидный размер пакета в заголовке: " +
-                                    $"'{AnsiEncoding.GetString(headerBuffer, 0, headerLength)}'. Ожидается ASCII-число.");
-                            }
-                        }    
-                        
-                        // Валидный заголовок
-
-                        if (payloadLength <= 0 || payloadLength > MaxPacketSize)
-                        {
-                            throw new InvalidDataException($"Недопустимый размер пакета: {payloadLength} байт.");
+                            throw new InvalidDataException(
+                                $"Размер пакета превышает лимит {MaxPacketSize} байт.");
                         }
 
-                        payloadLength += 1; //в коде клиента чата не учтен 0-й байт между prefix + #0 + AData
+                        int headerBytesLength = headerLength + 1; // цифры + #0
+                        int totalPacketLength = checked(headerBytesLength + wirePayloadLength);
 
-                        // Вычисляем, сколько байт занимает заголовок (строка цифр (#0 разделитель также входит в payload))
-                        // int headerLength = zeroIndex;
-                        int totalPacketLength = headerLength + payloadLength;
-                        // -------------------------------------------------------------
-
-                        // Выделяем память под весь пакет целиком (вместе с заголовком, его надо пересылать «как есть»)
-                        var buffer = new RefCountedBuffer(ArrayPool<byte>.Shared.Rent(totalPacketLength), totalPacketLength);
+                        var buffer = new RefCountedBuffer(
+                            ArrayPool<byte>.Shared.Rent(totalPacketLength),
+                            totalPacketLength);
 
                         try
                         {
                             var packetBuffer = buffer.Memory;
-                            // В буфере лежит только часть пакета. Сначала забираем то, что есть...
-                            headerBuffer.CopyTo(packetBuffer);
-                            // ...и дочитываем оставшийся хвост пакета напрямую из сети
-                            // Встроенный метод .NET сам сделает цикл, сдвиги и выбросит EndOfStreamException, если клиент отключится
-                            await _stream.ReadExactlyAsync(packetBuffer[HeaderBufferSize..], _sessionCts.Token);
+                            headerBuffer.AsMemory(0, headerBytesLength).CopyTo(packetBuffer);
+
+                            await _stream.ReadExactlyAsync(
+                                packetBuffer[headerBytesLength..],
+                                _sessionCts.Token).ConfigureAwait(false);
+
                             HandleAndRoutePacket(buffer);
                         }
                         finally
@@ -124,7 +157,7 @@ namespace UniChatServerd
                     if (_serverToken.IsCancellationRequested)
                         Log.Debug("[СЕССИЯ] Клиент {ClientIp} отключен из-за остановки сервера.", ep);
                     else
-                        Log.Debug("[СЕССИЯ] Клиент {ClientIp} закрыт по инициативе сервера.", ep);
+                        Log.Debug("[СЕССИЯ] Клиент {ClientIp} закрыт сервером.", ep);
                 }
                 catch (EndOfStreamException)
                 {
@@ -145,23 +178,22 @@ namespace UniChatServerd
                 {
                     Close();
 
-                    // ждем остановки Writer
                     try { await _writerTask.ConfigureAwait(false); }
-                    catch { /* уже залогировано */ }
+                    catch { /* ошибка уже обработана в WriterLoopAsync */ }
 
                     _sessionCts.Dispose();
                 }
             }
         }
-        
 
         /// <summary>
-        /// Маршрутизация
+        /// Маршрутизация. Пакеты пересылаются без изменения содержимого,
+        /// поэтому серверу не требуется разбирать текст или бинарные данные AData.
         /// </summary>
         private void HandleAndRoutePacket(RefCountedBuffer buffer)
         {
             ReadOnlyMemory<byte> packet = buffer.Memory;
-            // Вызываем синхронный метод-помощник для парсинга префикса пакета
+
             if (!TryParsePrefix(packet.Span, out string curId,
                                 out ReadOnlySpan<byte> marker, out string toUser))
             {
@@ -169,60 +201,65 @@ namespace UniChatServerd
                 return;
             }
 
-            // Проверяем, авторизован ли уже этот конкретный клиент на сервере?
+            if (string.IsNullOrWhiteSpace(curId))
+            {
+                Log.Warning("[СЕССИЯ] Получен пакет с пустым ID отправителя.");
+                Close();
+                return;
+            }
+
+            // Первый пакет регистрирует соединение. Во всех последующих пакетах
+            // отправитель обязан совпадать с ID, закреплённым за TCP-соединением.
             if (ClientId == null)
             {
-                // === ЭТАП АВТОРИЗАЦИИ ===
-                // Согласно протоколу, имя авторизации берем из curId (отправитель)
                 if (!_manager.AddConnection(curId, this))
                 {
                     Log.Warning("[СЕССИЯ] ID '{CurId}' уже занят. Отключаем дубликат.", curId);
                     Close();
                     return;
-                    // throw new InvalidDataException($"ID '{curId}' уже занят. Отключаем дубликат.");
                 }
+
                 ClientId = curId;
                 Log.Debug("[СЕССИЯ] Клиент '{ClientId}' успешно авторизован по протоколу UniChat.", ClientId);
             }
+            else if (!string.Equals(curId, ClientId, StringComparison.Ordinal))
+            {
+                Log.Warning(
+                    "[СЕССИЯ] Клиент '{ClientId}' прислал пакет с чужим ID '{CurId}'. Соединение закрывается.",
+                    ClientId, curId);
+                Close();
+                return;
+            }
 
-            // === ЭТАП МАРШРУТИЗАЦИИ И ПЕРЕСЫЛКИ ===
-            // Если команда в пакете равна "FORWARD"
             if (marker.SequenceEqual(ForwardMarker))
             {
                 if (toUser == "*")
                 {
-                    // Если адресат * шлем всем
                     Log.Debug("[СЕССИЯ] {ClientId} -> ВСЕМ ({PacketLength} байт)", ClientId, packet.Length);
                     _manager.SendBroadcast(buffer);
                 }
-                else if (string.IsNullOrWhiteSpace(toUser))
+                else if (!string.IsNullOrWhiteSpace(toUser))
                 {
-                    return;
-                }
-                else
-                {
-                    // Если указано конкретное имя — делаем точечную доставку получателю!
-                    Log.Debug("[СЕССИЯ] {ClientId} -> для '{ToUser}' ({PacketLength} байт)", ClientId, toUser, packet.Length);
+                    Log.Debug("[СЕССИЯ] {ClientId} -> для '{ToUser}' ({PacketLength} байт)",
+                        ClientId, toUser, packet.Length);
                     _manager.SendToClient(toUser, buffer);
                 }
             }
             else
             {
-                Log.Warning("[СЕССИЯ] Получена неизвестная команда от {ClientId}: {Marker}", ClientId, Convert.ToHexString(marker));
+                Log.Warning("[СЕССИЯ] Получена неизвестная команда от {ClientId}: {Marker}",
+                    ClientId, Convert.ToHexString(marker));
             }
         }
 
-
-        // SendText(inttostr(length(AData) + length(prefix)) + prefix + #0 + AData);
-        // prefix := #0 + CurID + #0'FORWARD'#0 + toUser + #0'UniChat'#0 + tmp;
-
         /// <summary>
-        /// Синхронный парсер префикса. Выделяет куски в стеке, что безопасно в C# 12 вне async-методов.
+        /// Извлекает первые четыре поля протокола, разделённые нулевыми байтами.
+        /// Остальная часть пакета остаётся непрозрачной и пересылается как есть.
         /// </summary>
         private static bool TryParsePrefix(
-            ReadOnlySpan<byte> fullPacket, 
-            out string curId, 
-            out ReadOnlySpan<byte> marker, 
+            ReadOnlySpan<byte> fullPacket,
+            out string curId,
+            out ReadOnlySpan<byte> marker,
             out string toUser)
         {
             curId = string.Empty;
@@ -235,91 +272,83 @@ namespace UniChatServerd
             int pieceCount = 0;
             int currentPos = 0;
 
-            // Режем пакет по нулевым байтам (#0)
             while (currentPos < fullPacket.Length && pieceCount < 4)
             {
                 int nextZero = fullPacket[currentPos..].IndexOf((byte)0);
                 if (nextZero == -1)
                 {
-                    if (currentPos < fullPacket.Length)
-                    {
-                        pieceOffsets[pieceCount] = currentPos;
-                        pieceLengths[pieceCount] = fullPacket.Length - currentPos;
-                        pieceCount++;
-                    }
+                    pieceOffsets[pieceCount] = currentPos;
+                    pieceLengths[pieceCount] = fullPacket.Length - currentPos;
+                    pieceCount++;
                     break;
                 }
 
                 pieceOffsets[pieceCount] = currentPos;
                 pieceLengths[pieceCount] = nextZero;
                 pieceCount++;
-
                 currentPos += nextZero + 1;
             }
 
-            // Защита: для извлечения toUser нам нужно как минимум 4 куска (0, 1, 2, 3)
-            if (pieceCount < 4) return false;
+            if (pieceCount < 4)
+                return false;
 
-            // Извлекаем все куски из Span памяти по сохраненным индексам
             ReadOnlySpan<byte> curIdBytes = fullPacket.Slice(pieceOffsets[1], pieceLengths[1]);
             ReadOnlySpan<byte> toUserBytes = fullPacket.Slice(pieceOffsets[3], pieceLengths[3]);
 
             curId = AnsiEncoding.GetString(curIdBytes);
             toUser = AnsiEncoding.GetString(toUserBytes);
-
             marker = fullPacket.Slice(pieceOffsets[2], pieceLengths[2]);
 
             return true;
         }
 
-        private static bool TryParseHeader(byte[] buffer, out int headerLength, out int payloadLength)
-        {
-            payloadLength = -1;
-            ReadOnlySpan<byte> currentData = buffer.AsSpan();
+        // SendText(IntToStr(Length(AData) + Length(prefix)) + prefix + #0 + AData);
+        // prefix := #0 + CurID + #0 + 'FORWARD' + #0 + toUser + #0 + 'UniChat' + #0 + tmp;
 
-            // Ищем нулевой байт
-            headerLength = currentData.IndexOf((byte)0);
-            if (headerLength == -1) return false;
-
-            // Парсим размер из UTF8-байтов напрямую в int
-            return Utf8Parser.TryParse(currentData[..headerLength], out payloadLength, out _);
-        }
-
-        // Владение буфером переходит каналу. Вызывающий больше НЕ должен Dispose-ить.
+        /// <summary>
+        /// Владение буфером переходит каналу. Вызывающий больше не освобождает эту ссылку.
+        /// </summary>
         public void EnqueuePacket(RefCountedBuffer buffer)
         {
             buffer.AddRef();
-            if (_outgoing.Writer.TryWrite(buffer)) return;
 
-            // не влезло
+            if (_outgoing.Writer.TryWrite(buffer))
+                return;
+
             buffer.Release();
-            // если еще не закрыт, то закрываем и пишем лог
+
             if (Close())
-            {
                 Log.Warning("[СЕССИЯ] Очередь {ClientId} переполнена, клиент будет отключен", ClientId);
-            }
         }
 
         private async Task WriterLoopAsync()
         {
             try
             {
-                await foreach (var buffer in _outgoing.Reader.ReadAllAsync())
+                await foreach (var buffer in _outgoing.Reader.ReadAllAsync(_sessionCts.Token))
                 {
                     try
                     {
-                        await _stream.WriteAsync(buffer.Memory).ConfigureAwait(false);
+                        await _stream.WriteAsync(buffer.Memory, _sessionCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (_sessionCts.IsCancellationRequested)
+                    {
+                        break;
                     }
                     catch (Exception ex)
                     {
                         Log.Warning(ex, "[СЕССИЯ] Ошибка отправки клиенту {ClientId}", ClientId);
-                        break;   // дальше писать бессмысленно, соединение битое
+                        break;
                     }
                     finally
                     {
-                        buffer.Release();   // владение буфера заканчивается здесь
+                        buffer.Release();
                     }
                 }
+            }
+            catch (OperationCanceledException) when (_sessionCts.IsCancellationRequested)
+            {
+                // Штатное завершение сессии.
             }
             catch (Exception ex)
             {
@@ -335,8 +364,10 @@ namespace UniChatServerd
                     buffer.Release();
                     drained++;
                 }
+
                 if (drained > 0)
-                    Log.Warning("[СЕССИЯ] Writer аварийно слил {Count} пакетов для '{ClientId}'", drained, ClientId);
+                    Log.Debug("[СЕССИЯ] Writer освободил {Count} ожидающих пакетов для '{ClientId}'",
+                        drained, ClientId);
             }
 
             Log.Debug("[СЕССИЯ] Writer остановлен для '{ClientId}'", ClientId);
@@ -353,14 +384,12 @@ namespace UniChatServerd
                 Log.Debug("[СЕССИЯ] Клиент '{ClientId}' удален из менеджера.", ClientId);
             }
 
-            // Говорим Writer'у: новых сообщений не будет, дорабатывай и выходи
             _outgoing.Writer.TryComplete();
-
-            // Будим ридер, если он висит на ReadExactlyAsync
             _sessionCts.Cancel();
-            return true;   // "я закрыл"
+
+            // Прерываем в том числе зависшую сетевую запись; Dispose повторно безопасен.
+            _client.Dispose();
+            return true;
         }
-
     }
-
 }
