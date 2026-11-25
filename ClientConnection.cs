@@ -20,6 +20,10 @@ namespace UniChatServerd
         private readonly ConnectionManager _manager;
         private readonly CancellationToken _serverToken;
         private readonly CancellationTokenSource _sessionCts;
+        private readonly AuditLog _auditLog;
+        private readonly string _sessionId = Guid.NewGuid().ToString("N");
+        private readonly string _remoteIp;
+        private readonly DateTimeOffset _connectedAtUtc = DateTimeOffset.UtcNow;
         private const int HeaderBufferSize = 16;
         // Максимум байт после заголовка размера, включая разделитель между prefix и AData.
         private const int MaxPacketSize = 128 * 1024;
@@ -33,9 +37,14 @@ namespace UniChatServerd
         private readonly Task _writerTask;
         private int _closed;
 
-        public ClientConnection(TcpClient client, ConnectionManager manager, CancellationToken serverToken)
+        public ClientConnection(TcpClient client, ConnectionManager manager, CancellationToken serverToken, AuditLog auditLog)
         {
             _client = client;
+            _auditLog = auditLog;
+            _remoteIp = client.Client.RemoteEndPoint is IPEndPoint endpoint
+                ? endpoint.Address.ToString()
+                : "unknown";
+            _auditLog.Record("session_open", _sessionId, remoteIp: _remoteIp);
             _manager = manager;
             _serverToken = serverToken;
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(serverToken);
@@ -153,26 +162,29 @@ namespace UniChatServerd
                 }
                 catch (OperationCanceledException)
                 {
-                    string ep = _client.Client?.RemoteEndPoint?.ToString() ?? "unknown";
-                    if (_serverToken.IsCancellationRequested)
-                        Log.Debug("[СЕССИЯ] Клиент {ClientIp} отключен из-за остановки сервера.", ep);
-                    else
-                        Log.Debug("[СЕССИЯ] Клиент {ClientIp} закрыт сервером.", ep);
+                    string reason = _serverToken.IsCancellationRequested ? "server_shutdown" : "cancelled";
+                    _auditLog.Record("session_cancelled", _sessionId, ClientId, _remoteIp, result: reason);
+                    Log.Debug("[СЕССИЯ] Клиент {ClientIp} отключен: {Reason}.", _remoteIp, reason);
+                    Close(reason);
                 }
                 catch (EndOfStreamException)
                 {
-                    string ep = _client.Client?.RemoteEndPoint?.ToString() ?? "unknown";
-                    Log.Debug("[СЕССИЯ] Клиент {ClientIp} штатно отключился.", ep);
+                    Log.Debug("[СЕССИЯ] Клиент {ClientIp} штатно отключился.", _remoteIp);
+                    Close("peer_closed");
                 }
-                catch (IOException)
+                catch (IOException ex)
                 {
-                    string ep = _client.Client?.RemoteEndPoint?.ToString() ?? "unknown";
-                    Log.Debug("[СЕССИЯ] Потеряна связь с клиентом {ClientIp}.", ep);
+                    _auditLog.Record("transport_error", _sessionId, ClientId, _remoteIp,
+                        result: "read_failed", details: ex.Message);
+                    Log.Debug(ex, "[СЕССИЯ] Потеряна связь с клиентом {ClientIp}.", _remoteIp);
+                    Close("network_error");
                 }
                 catch (Exception ex)
                 {
-                    string ep = _client.Client?.RemoteEndPoint?.ToString() ?? "unknown";
-                    Log.Warning(ex, "[СЕССИЯ] Ошибка при работе с клиентом {ClientIp}", ep);
+                    _auditLog.Record("session_error", _sessionId, ClientId, _remoteIp,
+                        result: "unhandled_exception", details: ex.Message);
+                    Log.Warning(ex, "[СЕССИЯ] Ошибка при работе с клиентом {ClientIp}", _remoteIp);
+                    Close("session_error");
                 }
                 finally
                 {
@@ -198,13 +210,17 @@ namespace UniChatServerd
                                 out ReadOnlySpan<byte> marker, out string toUser))
             {
                 Log.Warning("[СЕССИЯ] Битый пакет: не удалось разобрать структуру по маркерам #0.");
+                _auditLog.Record("protocol_error", _sessionId, ClientId, _remoteIp,
+                    packetBytes: packet.Length, result: "invalid_prefix");
                 return;
             }
 
             if (string.IsNullOrWhiteSpace(curId))
             {
                 Log.Warning("[СЕССИЯ] Получен пакет с пустым ID отправителя.");
-                Close();
+                _auditLog.Record("protocol_error", _sessionId, remoteIp: _remoteIp,
+                    packetBytes: packet.Length, result: "empty_client_id");
+                Close("protocol_error");
                 return;
             }
 
@@ -215,11 +231,14 @@ namespace UniChatServerd
                 if (!_manager.AddConnection(curId, this))
                 {
                     Log.Warning("[СЕССИЯ] ID '{CurId}' уже занят. Отключаем дубликат.", curId);
-                    Close();
+                    _auditLog.Record("protocol_error", _sessionId, curId, _remoteIp,
+                        packetBytes: packet.Length, result: "duplicate_client_id");
+                    Close("duplicate_client_id");
                     return;
                 }
 
                 ClientId = curId;
+                _auditLog.Record("client_connected", _sessionId, ClientId, _remoteIp, result: "registered");
                 Log.Debug("[СЕССИЯ] Клиент '{ClientId}' успешно авторизован по протоколу UniChat.", ClientId);
             }
             else if (!string.Equals(curId, ClientId, StringComparison.Ordinal))
@@ -227,7 +246,9 @@ namespace UniChatServerd
                 Log.Warning(
                     "[СЕССИЯ] Клиент '{ClientId}' прислал пакет с чужим ID '{CurId}'. Соединение закрывается.",
                     ClientId, curId);
-                Close();
+                _auditLog.Record("protocol_error", _sessionId, ClientId, _remoteIp,
+                    packetBytes: packet.Length, result: "client_id_mismatch", details: curId);
+                Close("client_id_mismatch");
                 return;
             }
 
@@ -235,20 +256,30 @@ namespace UniChatServerd
             {
                 if (toUser == "*")
                 {
-                    Log.Debug("[СЕССИЯ] {ClientId} -> ВСЕМ ({PacketLength} байт)", ClientId, packet.Length);
-                    _manager.SendBroadcast(buffer);
+                    int recipients = _manager.SendBroadcast(buffer);
+                    _auditLog.Record("message_routed", _sessionId, ClientId, _remoteIp,
+                        targetId: "*", packetBytes: packet.Length, result: "broadcast",
+                        details: $"queued_recipients={recipients}");
+                    Log.Debug("[СЕССИЯ] {ClientId} -> ВСЕМ ({PacketLength} байт), получателей: {Recipients}",
+                        ClientId, packet.Length, recipients);
                 }
                 else if (!string.IsNullOrWhiteSpace(toUser))
                 {
-                    Log.Debug("[СЕССИЯ] {ClientId} -> для '{ToUser}' ({PacketLength} байт)",
-                        ClientId, toUser, packet.Length);
-                    _manager.SendToClient(toUser, buffer);
+                    bool queued = _manager.SendToClient(toUser, buffer);
+                    _auditLog.Record("message_routed", _sessionId, ClientId, _remoteIp,
+                        targetId: toUser, packetBytes: packet.Length,
+                        result: queued ? "queued" : "recipient_offline");
+                    Log.Debug("[СЕССИЯ] {ClientId} -> для '{ToUser}' ({PacketLength} байт), результат: {Result}",
+                        ClientId, toUser, packet.Length, queued ? "queued" : "recipient_offline");
                 }
             }
             else
             {
+                string markerHex = Convert.ToHexString(marker);
                 Log.Warning("[СЕССИЯ] Получена неизвестная команда от {ClientId}: {Marker}",
-                    ClientId, Convert.ToHexString(marker));
+                    ClientId, markerHex);
+                _auditLog.Record("protocol_error", _sessionId, ClientId, _remoteIp,
+                    packetBytes: packet.Length, result: "unknown_command", details: markerHex);
             }
         }
 
@@ -308,17 +339,19 @@ namespace UniChatServerd
         /// <summary>
         /// Владение буфером переходит каналу. Вызывающий больше не освобождает эту ссылку.
         /// </summary>
-        public void EnqueuePacket(RefCountedBuffer buffer)
+        public bool EnqueuePacket(RefCountedBuffer buffer)
         {
             buffer.AddRef();
 
             if (_outgoing.Writer.TryWrite(buffer))
-                return;
+                return true;
 
             buffer.Release();
-
-            if (Close())
+            _auditLog.Record("queue_overflow", _sessionId, ClientId, _remoteIp,
+                packetBytes: buffer.Length, result: "client_disconnected");
+            if (Close("outgoing_queue_full"))
                 Log.Warning("[СЕССИЯ] Очередь {ClientId} переполнена, клиент будет отключен", ClientId);
+            return false;
         }
 
         private async Task WriterLoopAsync()
@@ -337,7 +370,10 @@ namespace UniChatServerd
                     }
                     catch (Exception ex)
                     {
+                        _auditLog.Record("transport_error", _sessionId, ClientId, _remoteIp,
+                            result: "write_failed", details: ex.Message);
                         Log.Warning(ex, "[СЕССИЯ] Ошибка отправки клиенту {ClientId}", ClientId);
+                        Close("send_error");
                         break;
                     }
                     finally
@@ -352,6 +388,8 @@ namespace UniChatServerd
             }
             catch (Exception ex)
             {
+                _auditLog.Record("session_error", _sessionId, ClientId, _remoteIp,
+                    result: "writer_failed", details: ex.Message);
                 Log.Error(ex, "[СЕССИЯ] Writer упал для {ClientId}", ClientId);
             }
             finally
@@ -373,16 +411,20 @@ namespace UniChatServerd
             Log.Debug("[СЕССИЯ] Writer остановлен для '{ClientId}'", ClientId);
         }
 
-        public bool Close()
+        public bool Close(string reason = "closed")
         {
             if (Interlocked.Exchange(ref _closed, 1) == 1)
                 return false;
 
             if (ClientId != null)
             {
-                _manager.RemoveConnection(ClientId);
+                _manager.RemoveConnection(ClientId, this);
                 Log.Debug("[СЕССИЯ] Клиент '{ClientId}' удален из менеджера.", ClientId);
             }
+
+            long durationMs = Math.Max(0, (long)(DateTimeOffset.UtcNow - _connectedAtUtc).TotalMilliseconds);
+            _auditLog.Record("session_closed", _sessionId, ClientId, _remoteIp,
+                durationMs: durationMs, result: reason);
 
             _outgoing.Writer.TryComplete();
             _sessionCts.Cancel();
