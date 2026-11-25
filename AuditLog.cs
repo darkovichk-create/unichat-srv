@@ -10,7 +10,7 @@ namespace UniChatServerd;
 /// Асинхронный журнал метаданных сессий, маршрутизации и ошибок.
 /// Содержимое пользовательских сообщений никогда не передаётся этому классу.
 /// </summary>
-internal sealed class AuditLog : BackgroundService
+public sealed class AuditLog : BackgroundService
 {
     private const int QueueCapacity = 8192;
     private const int BatchSize = 128;
