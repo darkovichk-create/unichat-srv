@@ -79,63 +79,92 @@ public sealed class AuditLog : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        SqliteConnection? connection = null;
-        try
+        while (!stoppingToken.IsCancellationRequested)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_databasePath)!);
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(Path.GetDirectoryName(_databasePath)!,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-
-            var connectionString = new SqliteConnectionStringBuilder
+            SqliteConnection? connection = null;
+            var pending = new List<AuditEvent>(BatchSize);
+            try
             {
-                DataSource = _databasePath,
-                Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
-                Pooling = true,
-                DefaultTimeout = 5
-            }.ToString();
+                Directory.CreateDirectory(Path.GetDirectoryName(_databasePath)!);
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(Path.GetDirectoryName(_databasePath)!,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-            connection = new SqliteConnection(connectionString);
-            await connection.OpenAsync(stoppingToken).ConfigureAwait(false);
-            await InitializeDatabaseAsync(connection, stoppingToken).ConfigureAwait(false);
+                var connectionString = new SqliteConnectionStringBuilder
+                {
+                    DataSource = _databasePath,
+                    Mode = SqliteOpenMode.ReadWriteCreate,
+                    Cache = SqliteCacheMode.Shared,
+                    Pooling = true,
+                    DefaultTimeout = 5
+                }.ToString();
 
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(_databasePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                connection = new SqliteConnection(connectionString);
+                await connection.OpenAsync(stoppingToken).ConfigureAwait(false);
+                await InitializeDatabaseAsync(connection, stoppingToken).ConfigureAwait(false);
 
-            Log.Information("Audit database opened at {DatabasePath}; retention is {RetentionDays} days",
-                _databasePath, (int)Retention.TotalDays);
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(_databasePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
-            await ConsumeQueueAsync(connection, stoppingToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            // Normal service shutdown.
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Audit database service failed");
-            throw;
-        }
-        finally
-        {
-            if (connection is not null)
+                Log.Information("Audit database opened at {DatabasePath}; retention is {RetentionDays} days",
+                    _databasePath, (int)Retention.TotalDays);
+
+                await ConsumeQueueAsync(connection, pending, stoppingToken).ConfigureAwait(false);
+                break;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex,
+                    "Audit database is unavailable; retrying in 5 seconds. TCP relay remains operational.");
+
+                // If a batch failed before commit, put it back into the bounded queue for retry.
+                foreach (var item in pending)
+                {
+                    if (!_queue.Writer.TryWrite(item))
+                    {
+                        long dropped = Interlocked.Increment(ref _droppedEvents);
+                        if (dropped == 1 || dropped % 100 == 0)
+                            Log.Warning("Audit queue is full while retrying; dropped {DroppedEvents} events", dropped);
+                    }
+                }
+                pending.Clear();
+
                 try
                 {
-                    var remaining = new List<AuditEvent>();
-                    while (_queue.Reader.TryRead(out var item))
-                        remaining.Add(item);
-
-                    if (remaining.Count > 0)
-                        await InsertBatchAsync(connection, remaining, CancellationToken.None).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
-                    Log.Error(ex, "Could not flush the final audit batch");
+                    break;
                 }
+            }
+            finally
+            {
+                if (connection is not null)
+                {
+                    if (stoppingToken.IsCancellationRequested &&
+                        connection.State == System.Data.ConnectionState.Open)
+                    {
+                        try
+                        {
+                            while (_queue.Reader.TryRead(out var item))
+                                pending.Add(item);
 
-                await connection.DisposeAsync().ConfigureAwait(false);
+                            if (pending.Count > 0)
+                                await InsertBatchAsync(connection, pending, CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "Could not flush the final audit batch during shutdown");
+                        }
+                    }
+
+                    await connection.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
     }
@@ -175,32 +204,30 @@ public sealed class AuditLog : BackgroundService
         await CleanupOldEventsAsync(connection, ct).ConfigureAwait(false);
     }
 
-    private async Task ConsumeQueueAsync(SqliteConnection connection, CancellationToken ct)
+    private async Task ConsumeQueueAsync(
+        SqliteConnection connection,
+        List<AuditEvent> pending,
+        CancellationToken ct)
     {
-        var batch = new List<AuditEvent>(BatchSize);
         var nextCleanup = DateTimeOffset.UtcNow.AddHours(1);
 
-        try
+        while (await _queue.Reader.WaitToReadAsync(ct).ConfigureAwait(false))
         {
-            while (await _queue.Reader.WaitToReadAsync(ct).ConfigureAwait(false))
+            pending.Clear();
+            while (pending.Count < BatchSize && _queue.Reader.TryRead(out var item))
+                pending.Add(item);
+
+            if (pending.Count > 0)
             {
-                batch.Clear();
-                while (batch.Count < BatchSize && _queue.Reader.TryRead(out var item))
-                    batch.Add(item);
-
-                if (batch.Count > 0)
-                    await InsertBatchAsync(connection, batch, ct).ConfigureAwait(false);
-
-                if (DateTimeOffset.UtcNow >= nextCleanup)
-                {
-                    await CleanupOldEventsAsync(connection, ct).ConfigureAwait(false);
-                    nextCleanup = DateTimeOffset.UtcNow.AddHours(1);
-                }
+                await InsertBatchAsync(connection, pending, ct).ConfigureAwait(false);
+                pending.Clear();
             }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            // Final flush is performed in ExecuteAsync.finally.
+
+            if (DateTimeOffset.UtcNow >= nextCleanup)
+            {
+                await CleanupOldEventsAsync(connection, ct).ConfigureAwait(false);
+                nextCleanup = DateTimeOffset.UtcNow.AddHours(1);
+            }
         }
     }
 
