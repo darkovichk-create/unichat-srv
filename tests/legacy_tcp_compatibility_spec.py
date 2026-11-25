@@ -44,6 +44,18 @@ def callback_frame_end(frame: bytes) -> int:
     return nul + 1 + int(frame[:nul].decode("ascii"))
 
 
+
+def build_documented_sender_frame(prefix: bytes, data: bytes) -> bytes:
+    """Model the C# comment: decimal(len(data)+len(prefix)) NUL prefix NUL data."""
+    advertised = len(prefix) + len(data)
+    return str(advertised).encode("ascii") + b"\\x00" + prefix + b"\\x00" + data
+
+
+def current_reader_frame_end(frame: bytes) -> int:
+    """Model ClientConnection.ReadHeaderAsync + wirePayloadLength=advertised."""
+    nul = frame.index(b"\\x00")
+    return nul + 1 + int(frame[:nul].decode("ascii"))
+
 class LegacyTcpCompatibilitySpecTests(unittest.TestCase):
     def setUp(self) -> None:
         self.metadata = legacy_metadata(
@@ -52,6 +64,19 @@ class LegacyTcpCompatibilitySpecTests(unittest.TestCase):
             header5=bytes.fromhex("7856341230"),
         )
         self.ciphertext = bytes(range(64))
+
+    def test_documented_sender_length_leaves_last_data_byte_in_current_reader(self) -> None:
+        prefix = b"\\x00alice\\x00FORWARD\\x00bob\\x00UniChat\\x00"
+        frame = build_documented_sender_frame(prefix, b"payload")
+        end = current_reader_frame_end(frame)
+        self.assertEqual(frame[end:], b"d")
+
+    def test_documented_sender_length_plus_separator_consumes_complete_frame(self) -> None:
+        prefix = b"\\x00alice\\x00FORWARD\\x00bob\\x00UniChat\\x00"
+        frame = build_documented_sender_frame(prefix, b"payload")
+        nul = frame.index(b"\\x00")
+        corrected_end = nul + 1 + int(frame[:nul].decode("ascii")) + 1
+        self.assertEqual(corrected_end, len(frame))
 
     def test_current_server_layout_is_parseable_by_current_prefix_contract(self) -> None:
         current_payload = b"alice\x00FORWARD\x00bob\x00UniChat\x00payload"
