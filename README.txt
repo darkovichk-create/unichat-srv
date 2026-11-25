@@ -138,6 +138,34 @@ for row in db.execute(query):
 PY
 ```
 
+### Read-only отчёт по аудиту
+
+В репозитории есть `audit-report.py` — локальный просмотрщик SQLite, открывающий БД строго в режиме `mode=ro`. Он не меняет схему, не удаляет записи и не запускает сетевой интерфейс.
+
+Установка скрипта на сервер:
+
+```bash
+sudo install -o root -g root -m 0755 audit-report.py /usr/local/bin/unichat-audit-report
+```
+
+Примеры:
+
+```bash
+# Сводка за последние 24 часа
+sudo unichat-audit-report --summary
+
+# Последние события за 6 часов
+sudo unichat-audit-report --since-hours 6 --limit 100
+
+# Все события конкретного клиента в JSON
+sudo unichat-audit-report --client "CLIENT_ID" --all --json
+
+# Явный путь к тестовой или резервной БД
+sudo unichat-audit-report --db /path/to/audit.db --summary
+```
+
+По умолчанию читается `/var/lib/unichatd/audit.db`. Для запуска нужны права чтения файла БД; содержимое сообщений в журнале отсутствует. Скрипт предназначен для локальной диагностики и не заменяет будущий аутентифицированный Management API.
+
 ## Сетевой доступ
 
 Разреши TCP/6666 только из нужной локальной сети. Например, если клиенты находятся в сети 192.168.1.0/24:
