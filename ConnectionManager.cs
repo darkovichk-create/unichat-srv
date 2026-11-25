@@ -1,4 +1,4 @@
-﻿// author Sergey Rihmayer
+﻿// Original UniChat server author: Sergey Rihmayer (s.rihmayer@mail.ru)
 
 using Serilog;
 using System;
