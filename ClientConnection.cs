@@ -266,7 +266,7 @@ namespace UniChatServerd
                 {
                     int recipients = _manager.SendBroadcast(buffer);
                     _auditLog.Record("message_routed", _sessionId, ClientId, _remoteIp,
-                        targetId: "*", packetBytes: packet.Length, result: "broadcast",
+                        targetId: "*", packetBytes: packet.Length, result: "queued_to_socket_queues",
                         details: $"queued_recipients={recipients}");
                     Log.Debug("[СЕССИЯ] {ClientId} -> ВСЕМ ({PacketLength} байт), получателей: {Recipients}",
                         ClientId, packet.Length, recipients);
@@ -276,7 +276,7 @@ namespace UniChatServerd
                     bool queued = _manager.SendToClient(toUser, buffer);
                     _auditLog.Record("message_routed", _sessionId, ClientId, _remoteIp,
                         targetId: toUser, packetBytes: packet.Length,
-                        result: queued ? "queued" : "recipient_offline");
+                        result: queued ? "queued_to_socket_queue" : "recipient_offline");
                     Log.Debug("[СЕССИЯ] {ClientId} -> для '{ToUser}' ({PacketLength} байт), результат: {Result}",
                         ClientId, toUser, packet.Length, queued ? "queued" : "recipient_offline");
                 }
