@@ -33,7 +33,7 @@ sudo apt install -y dotnet-sdk-10.0
 git clone https://github.com/darkovichk-create/unichat-srv.git
 cd unichat-srv
 dotnet publish UniChatServerd.csproj -c Release -r linux-x64 --self-contained true \
-  -p:PublishSingleFile=true -o ./publish
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./publish
 ```
 
 Для ARM64 VM замени RID на `linux-arm64`. Trimming намеренно не включён: сначала лучше получить предсказуемую сборку, а оптимизацию размера делать отдельно.
@@ -73,6 +73,7 @@ Group=unichatd
 WorkingDirectory=/opt/unichatd
 StateDirectory=unichatd
 StateDirectoryMode=0750
+Environment=DOTNET_BUNDLE_EXTRACT_BASE_DIR=/var/lib/unichatd/.net
 ExecStart=/opt/unichatd/UniChatServerd --ip 192.168.1.50 --port 6666 --log-level Information
 Restart=on-failure
 RestartSec=5
@@ -117,6 +118,25 @@ journalctl -u unichatd.service -f
 **Тело сообщений и вложений в SQLite не записывается.** Для личных сообщений фиксируются только метаданные маршрутизации. Статус `queued_to_socket_queue` означает, что пакет поставлен в очередь отправки, а не подтверждение фактического получения клиентом.
 
 Используется SQLite в WAL-режиме с асинхронной ограниченной очередью и пакетной записью. Старые события удаляются при старте и далее не реже одного раза в час; срок хранения — 20 дней. База предназначена для оперативной диагностики, а не для долговременного архива или аналитического хранилища.
+
+Пример просмотра последних 50 событий (время отображается в UTC):
+
+```bash
+sudo python3 - <<'PY'
+import sqlite3
+
+db = sqlite3.connect("file:/var/lib/unichatd/audit.db?mode=ro", uri=True)
+query = """
+SELECT datetime(timestamp_utc / 1000, 'unixepoch'),
+       event_type, client_id, remote_ip, target_id, result, details
+FROM audit_events
+ORDER BY timestamp_utc DESC
+LIMIT 50
+"""
+for row in db.execute(query):
+    print(" | ".join("" if value is None else str(value) for value in row))
+PY
+```
 
 ## Сетевой доступ
 
