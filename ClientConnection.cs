@@ -424,6 +424,11 @@ namespace UniChatServerd
             if (Interlocked.Exchange(ref _closed, 1) == 1)
                 return false;
 
+            if (reason == "closed" && _serverToken.IsCancellationRequested)
+                reason = "server_shutdown";
+            else if (reason == "closed" && _sessionCts.IsCancellationRequested)
+                reason = "cancelled";
+
             if (ClientId != null)
             {
                 _manager.RemoveConnection(ClientId, this);
