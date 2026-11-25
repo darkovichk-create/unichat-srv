@@ -1,4 +1,4 @@
-// author Sergey Rihmayer
+// Original UniChat server author: Sergey Rihmayer (s.rihmayer@mail.ru)
 
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Serilog;
