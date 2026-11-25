@@ -41,6 +41,15 @@ def read_current_server_frame(frame: bytes) -> tuple[int, bytes]:
     return end, frame[start:end]
 
 
+def client_receiver_frame_end(frame: bytes) -> int:
+    """Model current client callback: decimal digit count + NUL + advertised bytes."""
+    header_end = frame.find(b"\\x00")
+    if header_end <= 0:
+        raise ValueError("missing decimal header")
+    advertised = int(frame[:header_end].decode("ascii"))
+    return header_end + 1 + advertised
+
+
 def parse_server_prefix(payload: bytes) -> tuple[bytes, bytes, bytes] | None:
     fields = payload.split(b"\x00", 3)
     if len(fields) < 3 or not fields[0]:
@@ -76,6 +85,34 @@ class CurrentDelphiDedicatedTcpSpecTests(unittest.TestCase):
         end, payload = read_current_server_frame(frame)
         self.assertEqual(len(payload), len(frame) - frame.index(b"\x00") - 1)
         self.assertEqual(end, len(frame))
+
+    def test_client_receiver_boundary_matches_sender_and_server_reader(self) -> None:
+        frame = build_current_dedicated_frame(
+            b"alice", b"bob", self.header5, self.primary
+        )
+        receiver_end = client_receiver_frame_end(frame)
+        server_end, _ = read_current_server_frame(frame)
+        self.assertEqual(receiver_end, server_end)
+        self.assertEqual(receiver_end, len(frame))
+
+    def test_client_receiver_preserves_next_frame_after_coalesced_reads(self) -> None:
+        first = build_current_dedicated_frame(
+            b"alice", b"bob", self.header5, b"first-payload"
+        )
+        second = build_current_dedicated_frame(
+            b"bob", b"alice", self.header5, b"second-payload"
+        )
+        end = client_receiver_frame_end(first + second)
+        self.assertEqual((first + second)[end:], second)
+
+    def test_inner_unichat_marker_and_five_byte_header_are_in_frame(self) -> None:
+        frame = build_current_dedicated_frame(
+            b"alice", b"bob", self.header5, self.primary
+        )
+        _, payload = read_current_server_frame(frame)
+        marker = b"\\x00UniChat\\x00"
+        marker_offset = payload.index(marker)
+        self.assertEqual(payload[marker_offset + len(marker):][:5], self.header5)
 
     def test_two_coalesced_frames_leave_next_decimal_header_intact(self) -> None:
         first = build_current_dedicated_frame(
